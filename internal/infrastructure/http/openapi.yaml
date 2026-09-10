@@ -1,0 +1,220 @@
+openapi: 3.0.3
+info:
+  title: go-payment-methods-hub
+  version: 1.0.0
+  description: |
+    Hub de métodos de pago: tokeniza tarjetas, enruta operaciones al proveedor
+    adecuado según método, país y disponibilidad, y normaliza los errores de
+    terceros. El número de tarjeta se recibe, se tokeniza y se descarta: nunca
+    se almacena ni se registra en los logs.
+servers:
+  - url: http://localhost:8081
+    description: Entorno local
+tags:
+  - name: Tokens
+    description: Tokenización de tarjetas
+  - name: Operaciones
+    description: Cobros (cash-in) y pagos (cash-out)
+  - name: Enrutamiento
+    description: Selección explicable de proveedor
+components:
+  parameters:
+    MerchantId:
+      name: X-Merchant-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Identificador del comercio; base del aislamiento multitenant.
+  schemas:
+    CardToken:
+      type: object
+      description: Representación segura de una tarjeta. No contiene el PAN.
+      properties:
+        token: { type: string, example: tok_a1b2 }
+        merchant_id: { type: string }
+        brand: { type: string, enum: [visa, mastercard, amex, unknown] }
+        last4: { type: string, example: "4242" }
+        exp_month: { type: integer, example: 12 }
+        exp_year: { type: integer, example: 2028 }
+        fingerprint:
+          type: string
+          description: Huella estable de la tarjeta; no permite reconstruir el número.
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time, nullable: true }
+    Decision:
+      type: object
+      description: Decisión de enrutamiento, con su motivo y alternativas.
+      properties:
+        provider_id: { type: string, example: prov_bo }
+        reason: { type: string }
+        alternatives: { type: array, items: { type: string } }
+    Outcome:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            provider_id: { type: string }
+            external_ref: { type: string }
+            status: { type: string, example: approved }
+            code: { type: string }
+        decision: { $ref: '#/components/schemas/Decision' }
+        attempts:
+          type: array
+          description: Rastro de cada intento, incluidos los fallidos.
+          items:
+            type: object
+            properties:
+              provider_id: { type: string }
+              succeeded: { type: boolean }
+              error: { type: string }
+    Problem:
+      type: object
+      description: Error en formato RFC 7807 con código normalizado.
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string, example: insufficient_funds }
+  responses:
+    Problem:
+      description: Error de negocio o validación
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+paths:
+  /v1/payment-methods:
+    get:
+      tags: [Enrutamiento]
+      summary: Métodos de pago soportados
+      parameters: [{ $ref: '#/components/parameters/MerchantId' }]
+      responses:
+        '200':
+          description: Lista de métodos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  methods: { type: array, items: { type: string } }
+  /v1/tokens:
+    post:
+      tags: [Tokens]
+      summary: Tokeniza una tarjeta
+      description: |
+        Valida el número con el algoritmo de Luhn y la vigencia, cifra el
+        instrumento en el vault y devuelve un token opaco. El PAN se descarta.
+      parameters: [{ $ref: '#/components/parameters/MerchantId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [number, exp_month, exp_year]
+              properties:
+                number: { type: string, example: "4242424242424242" }
+                exp_month: { type: integer, example: 12 }
+                exp_year: { type: integer, example: 2028 }
+      responses:
+        '201':
+          description: Token creado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CardToken' }
+        '422': { $ref: '#/components/responses/Problem' }
+  /v1/tokens/{token}:
+    get:
+      tags: [Tokens]
+      summary: Metadatos del token
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Token encontrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CardToken' }
+        '404': { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Tokens]
+      summary: Revoca un token
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Token revocado }
+        '404': { $ref: '#/components/responses/Problem' }
+  /v1/charges:
+    post:
+      tags: [Operaciones]
+      summary: Cobro (cash-in)
+      parameters: [{ $ref: '#/components/parameters/MerchantId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, currency, method, country]
+              properties:
+                amount: { type: integer, format: int64, example: 15000 }
+                currency: { type: string, example: BOB }
+                method: { type: string, enum: [card, bank_transfer, cash, qr] }
+                token: { type: string }
+                country: { type: string, example: BO }
+      responses:
+        '200':
+          description: Operación procesada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Outcome' }
+        '402': { $ref: '#/components/responses/Problem' }
+        '502': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /v1/payouts:
+    post:
+      tags: [Operaciones]
+      summary: Pago a tercero (cash-out)
+      parameters: [{ $ref: '#/components/parameters/MerchantId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, currency, method, country]
+              properties:
+                amount: { type: integer, format: int64 }
+                currency: { type: string }
+                method: { type: string, enum: [card, bank_transfer, cash, qr] }
+                country: { type: string }
+      responses:
+        '200':
+          description: Pago procesado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Outcome' }
+        '502': { $ref: '#/components/responses/Problem' }
+  /v1/routing/preview:
+    get:
+      tags: [Enrutamiento]
+      summary: Explica qué proveedor se elegiría y por qué
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+        - { name: method, in: query, required: true, schema: { type: string } }
+        - { name: country, in: query, required: true, schema: { type: string } }
+        - { name: currency, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Decisión de enrutamiento
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Decision' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /healthz:
+    get: { summary: Liveness, responses: { '200': { description: Vivo } } }
+  /readyz:
+    get: { summary: Readiness, responses: { '200': { description: Listo } } }
